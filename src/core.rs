@@ -3,12 +3,14 @@
 use crate::error::{DistillError, Result};
 use ahash::AHasher;
 use rustc_hash::{FxHashMap, FxHashSet};
+use indexmap::IndexMap;
 use serde_json::{json, Map, Value};
 use std::hash::{Hash, Hasher};
+use md5::{Md5, Digest};
 
 // Optimized: Use Vec instead of SmallVec for recursive types (avoids cycle)
 // Pre-allocate with capacity to minimize allocations
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum DeepStructureKey {
     Primitive(&'static str),  // Zero-allocation for common type names
     Dict(Vec<(String, DeepStructureKey)>),  // Sorted vec
@@ -16,10 +18,65 @@ enum DeepStructureKey {
     EmptyList,
 }
 
-// Optimized: Use FxHashMap instead of Arc<DashMap> (single-threaded = no sync overhead)
-type StructureCache = FxHashMap<u64, DeepStructureKey>;
-type MemoCache = FxHashMap<(String, bool), Value>;
-type FirstExampleCache = FxHashMap<String, Value>;
+// Implement Ord to match Python's tuple comparison behavior
+// Python sorts by repr() when types can't be compared directly
+impl Ord for DeepStructureKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.to_python_repr().cmp(&other.to_python_repr())
+    }
+}
+
+impl PartialOrd for DeepStructureKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl DeepStructureKey {
+    /// Convert to Python repr() format for MD5 hashing
+    /// This must match Python's repr() exactly for hash compatibility
+    fn to_python_repr(&self) -> String {
+        match self {
+            DeepStructureKey::Primitive(type_name) => {
+                format!("('primitive', '{}')", type_name)
+            }
+            DeepStructureKey::EmptyList => {
+                "('list', 'empty')".to_string()
+            }
+            DeepStructureKey::List(elements) => {
+                // Elements are already sorted when DeepStructureKey::List is created
+                // Don't sort again here - that would use string comparison instead of tuple comparison
+                let element_reprs: Vec<String> = elements
+                    .iter()
+                    .map(|e| e.to_python_repr())
+                    .collect();
+                // Python requires trailing comma for single-element tuples: (x,) not (x)
+                if element_reprs.len() == 1 {
+                    format!("('list', ({},))", element_reprs[0])
+                } else {
+                    format!("('list', ({}))", element_reprs.join(", "))
+                }
+            }
+            DeepStructureKey::Dict(items) => {
+                let items_repr: Vec<String> = items
+                    .iter()
+                    .map(|(k, v)| format!("('{}', {})", k, v.to_python_repr()))
+                    .collect();
+                // Python requires trailing comma for single-element tuples: (x,) not (x)
+                if items_repr.len() == 1 {
+                    format!("('dict', ({},))", items_repr[0])
+                } else {
+                    format!("('dict', ({}))", items_repr.join(", "))
+                }
+            }
+        }
+    }
+}
+
+// Use IndexMap for insertion-order preservation (matches Python dict behavior)
+type StructureCache = FxHashMap<u64, DeepStructureKey>;  // Order doesn't matter for this cache
+// MemoCache key format matches Python: (is_signature, hash, depth, example_index)
+type MemoCache = IndexMap<(bool, String, usize, usize), Value>;  // Preserve order
 
 /// Hash a JSON Value directly without serialization (10-50x faster than serde+md5)
 #[inline]
@@ -101,12 +158,13 @@ fn get_deep_structure_key_impl(
 ) -> Result<DeepStructureKey> {
     match item {
         Value::Object(map) => {
-            // Optimization: Pre-allocate with exact capacity
+            // DON'T sort! Python preserves insertion order for dicts (3.7+)
+            // Sorting would produce different structure hashes
             let mut pairs: Vec<(String, DeepStructureKey)> = Vec::with_capacity(map.len());
             for (k, v) in map {
                 pairs.push((k.clone(), get_deep_structure_key_cached(v, strict_typing, cache)?));
             }
-            pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            // Note: serde_json::Map preserves insertion order, so we maintain it
             Ok(DeepStructureKey::Dict(pairs))
         }
         Value::Array(list) => {
@@ -158,13 +216,69 @@ fn get_deep_structure_key_impl(
     }
 }
 
+/// Pass 1: Collect minimum depth for each structure hash
+/// Used when position_dependent=false to show examples only at shallowest occurrence
+fn collect_structure_depths(
+    container: &Value,
+    depth: usize,
+    strict_typing: bool,
+    cache: &mut StructureCache,
+    accumulator: &mut FxHashMap<String, usize>,
+) -> Result<()> {
+    match container {
+        Value::Object(map) => {
+            // Recurse on all values
+            for v in map.values() {
+                collect_structure_depths(v, depth + 1, strict_typing, cache, accumulator)?;
+            }
+            Ok(())
+        }
+        Value::Array(list) => {
+            if list.is_empty() {
+                return Ok(());
+            }
+
+            // Skip lists of primitives (same logic as distill_recursive)
+            let is_list_of_primitives = list.iter().all(|item| {
+                !matches!(item, Value::Object(_) | Value::Array(_))
+            });
+
+            if is_list_of_primitives {
+                return Ok(());
+            }
+
+            // Compute hashes for all items in this list
+            for item in list {
+                let deep_key = get_deep_structure_key_cached(item, strict_typing, cache)?;
+                let current_hash = generate_hash(&deep_key)?;
+
+                // Track minimum depth for this hash
+                accumulator
+                    .entry(current_hash)
+                    .and_modify(|min_depth| *min_depth = (*min_depth).min(depth))
+                    .or_insert(depth);
+
+                // Recurse into the item to find nested structures
+                collect_structure_depths(item, depth + 1, strict_typing, cache, accumulator)?;
+            }
+
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 #[inline]
 fn generate_hash(key: &DeepStructureKey) -> Result<String> {
-    let mut hasher = AHasher::default();
-    key.hash(&mut hasher);
-    let hash = hasher.finish();
-    // Optimization: Use truncation instead of format for speed
-    Ok(format!("{:08x}", (hash & 0xFFFFFFFF) as u32))
+    // Use MD5 to match Python's hash generation exactly
+    // Python: hashlib.md5(repr(key).encode('utf-8')).hexdigest()[:8]
+    let repr_string = key.to_python_repr();
+    let mut hasher = Md5::new();
+    hasher.update(repr_string.as_bytes());
+    let result = hasher.finalize();
+    // Take first 8 hex characters (4 bytes)
+    Ok(format!("{:02x}{:02x}{:02x}{:02x}",
+        result[0], result[1], result[2], result[3]))
 }
 
 #[inline]
@@ -197,28 +311,28 @@ fn find_adjacent_patterns_python_style(hash_sequence: &[String]) -> Vec<Value> {
         }
 
         // Check for alternating pattern (AB AB AB...)
+        // Matches Python: requires pattern to appear at i+2:i+4
         if i + 3 < n {
-            // Optimization: Avoid creating temporary vec
             if hash_sequence[i + 2] == hash_sequence[i] &&
                hash_sequence[i + 3] == hash_sequence[i + 1] {
                 let pattern_a = &hash_sequence[i];
                 let pattern_b = &hash_sequence[i + 1];
 
+                // Count how many complete pairs we have
+                // Start at 1 since we've confirmed pattern appears twice (at i:i+2 and i+2:i+4)
                 let mut run_len_pairs = 1;
-                while i + (run_len_pairs + 1) * 2 + 1 < n &&
-                      hash_sequence[i + run_len_pairs * 2 + 2] == *pattern_a &&
-                      hash_sequence[i + run_len_pairs * 2 + 3] == *pattern_b {
+                while i + (run_len_pairs + 1) * 2 <= n &&
+                      hash_sequence.get(i + run_len_pairs * 2) == Some(pattern_a) &&
+                      hash_sequence.get(i + run_len_pairs * 2 + 1) == Some(pattern_b) {
                     run_len_pairs += 1;
                 }
 
-                if run_len_pairs >= 1 {
-                    output_sequence.push(json!({
-                        "pattern": [pattern_a, pattern_b],
-                        "repeat": run_len_pairs
-                    }));
-                    i += run_len_pairs * 2;
-                    continue;
-                }
+                output_sequence.push(json!({
+                    "pattern": [pattern_a, pattern_b],
+                    "repeat": run_len_pairs
+                }));
+                i += run_len_pairs * 2;
+                continue;
             }
         }
 
@@ -264,8 +378,11 @@ fn distill_recursive(
     strict_typing: bool,
     _repeat_threshold: usize,
     memoized_examples: &mut MemoCache,
-    first_examples_cache: &mut FirstExampleCache,
     structure_cache: &mut StructureCache,
+    depth: usize,
+    min_depths: &FxHashMap<String, usize>,
+    position_dependent: bool,
+    global_examples_shown: &mut FxHashMap<String, usize>, // Matches Python's global_examples_tracker
 ) -> Result<Value> {
     match original_container {
         Value::Object(map) => {
@@ -274,7 +391,7 @@ fn distill_recursive(
             for (k, v_original) in map {
                 new_map.insert(
                     k.clone(),
-                    distill_recursive(v_original, strict_typing, _repeat_threshold, memoized_examples, first_examples_cache, structure_cache)?
+                    distill_recursive(v_original, strict_typing, _repeat_threshold, memoized_examples, structure_cache, depth + 1, min_depths, position_dependent, global_examples_shown)?
                 );
             }
             Ok(Value::Object(new_map))
@@ -326,12 +443,12 @@ fn distill_recursive(
             }
 
             // Normal distillation for lists of objects/arrays
-            // Optimization: Pre-allocate vectors with capacity
+            // Use IndexMap to preserve insertion order (matches Python dict behavior)
             let mut hash_sequence: Vec<String> = Vec::with_capacity(original_list.len());
-            let mut first_occurrence_indices: FxHashMap<String, usize> = FxHashMap::with_capacity_and_hasher(
-                original_list.len() / 10,  // Estimate 10% unique structures
-                Default::default()
-            );
+            let mut first_occurrence_indices: IndexMap<String, usize> = IndexMap::with_capacity(original_list.len() / 10);
+            // Create LOCAL first_examples for this array (like Python's first_items_to_distill)
+            // This ensures each depth level gets its own examples, not global ones
+            let mut local_first_examples: IndexMap<String, Value> = IndexMap::new();
 
             // First pass: compute hashes and track first occurrences
             for (i, item) in original_list.iter().enumerate() {
@@ -340,25 +457,26 @@ fn distill_recursive(
                 hash_sequence.push(current_hash.clone());
 
                 first_occurrence_indices.entry(current_hash.clone()).or_insert_with(|| {
-                    first_examples_cache.entry(current_hash).or_insert_with(|| item.clone());
+                    local_first_examples.entry(current_hash.clone()).or_insert_with(|| item.clone());
                     i
                 });
             }
 
-            // Second pass: distill first examples
-            let mut distilled_first_examples: FxHashMap<String, Value> = FxHashMap::with_capacity_and_hasher(
-                first_occurrence_indices.len(),
-                Default::default()
+            // Second pass: distill first examples (IndexMap preserves insertion order)
+            let mut distilled_first_examples: IndexMap<String, Value> = IndexMap::with_capacity(
+                first_occurrence_indices.len()
             );
 
             for hash in first_occurrence_indices.keys() {
-                let memo_key = (hash.clone(), false);
+                // Match Python's memo_key format EXACTLY: (is_signature=false, hash, depth, example_index=0)
+                // example_index is 0 since we only show one example per hash (MAX_EXAMPLES_PER_STRUCTURE=1)
+                let memo_key = (false, hash.clone(), depth, 0);
 
                 if let Some(cached_value) = memoized_examples.get(&memo_key) {
                     distilled_first_examples.insert(hash.clone(), cached_value.clone());
                 } else {
-                    // Clone the original item to avoid borrow checker issues
-                    let original_item = first_examples_cache.get(hash)
+                    // Get the original item from LOCAL cache (matches Python's per-depth behavior)
+                    let original_item = local_first_examples.get(hash)
                         .ok_or_else(|| DistillError::Internal(format!("Original first example missing for hash {}", hash)))?
                         .clone();
 
@@ -367,8 +485,11 @@ fn distill_recursive(
                         strict_typing,
                         _repeat_threshold,
                         memoized_examples,
-                        first_examples_cache,
-                        structure_cache
+                        structure_cache,
+                        depth + 1,
+                        min_depths,
+                        position_dependent,
+                        global_examples_shown
                     )?;
                     memoized_examples.insert(memo_key, distilled_value.clone());
                     distilled_first_examples.insert(hash.clone(), distilled_value);
@@ -406,8 +527,8 @@ fn distill_recursive(
                     }
 
                     let summary_obj = json!({
-                        "summarized_pattern": pattern_string,
-                        "item_count": summarized_hashes.len()
+                        "item_count": summarized_hashes.len(),
+                        "summarized_pattern": pattern_string
                     });
                     output_list.push(summary_obj);
                     summarized_hashes.clear();
@@ -416,7 +537,22 @@ fn distill_recursive(
 
             for (i, current_hash) in hash_sequence.iter().enumerate() {
                 let is_first = first_occurrence_indices[current_hash] == i;
-                if is_first {
+
+                // Determine whether to show example based on position_dependent mode
+                // Matches Python's logic exactly
+                let should_show_example = if position_dependent {
+                    // Position-dependent: show examples independently at each depth level
+                    is_first
+                } else {
+                    // Position-independent: show ONLY at minimum depth (shallowest occurrence)
+                    // AND only if we haven't shown this hash before (global counter check)
+                    let hash_min_depth = min_depths.get(current_hash).copied().unwrap_or(usize::MAX);
+                    let examples_shown_count = global_examples_shown.get(current_hash).copied().unwrap_or(0);
+                    // MAX_EXAMPLES_PER_STRUCTURE = 1 in Python, so check < 1
+                    is_first && depth == hash_min_depth && examples_shown_count < 1
+                };
+
+                if should_show_example {
                     process_summary_block(&mut summarized_hashes_block, &mut hashes_referenced_in_summaries, &mut new_list);
 
                     let distilled_item = distilled_first_examples.get(current_hash)
@@ -425,6 +561,9 @@ fn distill_recursive(
 
                     first_item_positions.insert(current_hash.clone(), new_list.len());
                     new_list.push(distilled_item);
+
+                    // Increment global counter (matches Python's global_examples_tracker)
+                    *global_examples_shown.entry(current_hash.clone()).or_insert(0) += 1;
                 } else {
                     summarized_hashes_block.push(current_hash.clone());
                 }
@@ -453,28 +592,43 @@ pub fn distill_json(
     json_data: Value,
     strict_typing: bool,
     repeat_threshold: usize,
+    position_dependent: bool,
 ) -> Result<Value> {
-    // Optimization: Use FxHashMap instead of Arc<DashMap> (no sync overhead)
-    let mut memoized_examples: MemoCache = FxHashMap::default();
-    let mut first_examples_cache: FirstExampleCache = FxHashMap::default();
+    // Use IndexMap for insertion-order preservation (matches Python behavior)
+    let mut memoized_examples: MemoCache = IndexMap::new();
     let mut structure_cache: StructureCache = FxHashMap::default();
+    // Global counter for examples shown (matches Python's global_examples_tracker)
+    let mut global_examples_shown: FxHashMap<String, usize> = FxHashMap::default();
+
+    // Pass 1: Collect minimum depths for each hash (when position_dependent=false)
+    let mut min_depths: FxHashMap<String, usize> = FxHashMap::default();
+    if !position_dependent && matches!(json_data, Value::Object(_) | Value::Array(_)) {
+        collect_structure_depths(&json_data, 0, strict_typing, &mut structure_cache, &mut min_depths)?;
+    }
 
     let distilled_data = distill_recursive(
         &json_data,
         strict_typing,
         repeat_threshold,
         &mut memoized_examples,
-        &mut first_examples_cache,
         &mut structure_cache,
+        0,
+        &min_depths,
+        position_dependent,
+        &mut global_examples_shown,
     )?;
 
     let description = format!(
-        "Distilled JSON structure. Shows the first encountered example for each unique deep structure within lists. \
-        Items between these examples are summarized by a 'summarized_pattern' object, indicating the sequence \
-        of structure hashes (e.g., hashA hashB(x3) [hashC hashD](x2)) and the total item count. \
-        First examples are labeled with '_structure_hash' only if their hash appears in a subsequent summary pattern. \
-        Strict primitive typing for structure detection: {}. Repeat threshold for pattern summarization (internal, affects formatting): >=2.",
-        strict_typing
+        "Distilled JSON structure. Shows the first encountered example for each unique deep structure within lists.
+POSITION_DEPENDENT mode: {}
+  - true: Examples shown independently at each nesting level (predictable, depth-aware).
+  - false: Examples shown only at shallowest occurrence (more concise, globally unique).
+Items between these examples are summarized by a 'summarized_pattern' object, indicating the sequence
+of structure hashes (e.g., hashA hashB(x3) [hashC hashD](x2)) and the total item count.
+First examples are labeled with '_structure_hash' only if their hash appears in a subsequent summary pattern.
+Strict primitive typing for structure detection: {}. Repeat threshold for pattern summarization (internal, affects formatting): >=2.",
+        if position_dependent { "true" } else { "false" },
+        if strict_typing { "true" } else { "false" }
     );
 
     let mut final_output_map = Map::new();

@@ -23,6 +23,10 @@ pub struct DistillRequest {
     /// Minimum repeat count for summarization (default: 2)
     #[serde(default = "default_repeat_threshold")]
     pub repeat_threshold: usize,
+    /// Position-dependent mode: show examples at each nesting level (default: true)
+    /// When false, shows examples only at shallowest depth (more concise)
+    #[serde(default = "default_position_dependent")]
+    pub position_dependent: bool,
 }
 
 fn default_strict_typing() -> bool {
@@ -31,6 +35,10 @@ fn default_strict_typing() -> bool {
 
 fn default_repeat_threshold() -> usize {
     2
+}
+
+fn default_position_dependent() -> bool {
+    false  // Match Python's default (POSITION_DEPENDENT = False)
 }
 
 #[derive(Clone)]
@@ -70,6 +78,7 @@ impl JsonDistillerServer {
             input_value,
             params.strict_typing,
             params.repeat_threshold,
+            params.position_dependent,
         )
         .map_err(|e: DistillError| McpError {
             code: ErrorCode(-32603), // Internal error

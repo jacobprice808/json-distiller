@@ -56,8 +56,9 @@ json-distiller input.json --strict-typing=false -r 1
 ```
 
 **Options:**
-- `--strict-typing` - Differentiate int/float types (default: true)
-- `-r, --repeat-threshold <N>` - Min repeats to summarize (default: 2)
+- `--strict-typing=<bool>` - Differentiate int/float types (default: true)
+- `--position-dependent=<bool>` - Control example display across nesting levels (default: true)
+- `-r, --repeat-threshold <N>` - Min repeats to summarize (default: 1)
 
 ### As MCP Server (for Claude Code/Desktop)
 
@@ -191,16 +192,101 @@ Tested with 23 edge cases including: empty structures, deep nesting, unicode, mi
 
 ## Configuration
 
-### `strict_typing` (default: true)
+All configuration options work in both CLI and MCP modes.
 
-- `true`: Treats int and float as different types (more precise)
-- `false`: All primitives are generic "values" (more compression)
+### `--strict-typing` (default: `true`)
 
-### `repeat_threshold` (default: 2)
+Controls whether integers and floats are treated as distinct structure types.
 
-- `1`: Aggressive - summarize after 1 repeat
-- `2`: Balanced - summarize after 2 repeats (recommended)
-- `3+`: Conservative - require more repeats before summarizing
+**When `true` (recommended for most use cases):**
+- `{"score": 42}` and `{"score": 42.0}` have **different** structures
+- More precise structure detection
+- Better for understanding typed data
+
+**When `false`:**
+- All number types treated as generic "number"
+- Higher compression on numeric data
+- Use when type precision doesn't matter
+
+**Example:**
+```bash
+json-distiller data.json --strict-typing=false
+```
+
+### `--position-dependent` (default: `true`)
+
+Controls how structure examples are displayed across different nesting levels.
+
+**When `true` (depth-aware mode):**
+- Shows examples independently at each nesting level
+- Same structure appearing at different depths will show separate examples
+- More predictable: you see examples for each level you're analyzing
+- **Use when:** You need to see structure at every nesting level
+
+**When `false` (global mode):**
+- Shows examples only at the shallowest occurrence
+- Same structure at deeper levels is fully summarized
+- More concise output
+- **Use when:** You want minimal examples, maximum compression
+
+**Example scenario:**
+Given nested sports data where "league" structure appears both at top-level and within sections:
+
+- `position-dependent=true`: Shows league example at top level AND within sections
+- `position-dependent=false`: Shows league example only at top level, summarizes nested occurrences
+
+**Example:**
+```bash
+json-distiller data.json --position-dependent=false
+```
+
+### `-r, --repeat-threshold` (default: `1`)
+
+Controls internal pattern formatting in summaries. This affects how repetition patterns are displayed.
+
+**Values:**
+- `1`: Most aggressive - summarize all patterns
+- `2`: Balanced - require 2+ repeats (recommended)
+- `3+`: Conservative - require more evidence before pattern summarization
+
+**Example:**
+```bash
+json-distiller data.json -r 2
+```
+
+### MCP-Specific Parameters
+
+When using JSON Distiller as an MCP server with Claude, additional parameters are available:
+
+#### `strict_typing` (boolean, default: `true`)
+Same as CLI option above.
+
+#### `position_dependent` (boolean, default: `true`)
+Same as CLI option above.
+
+#### `repeat_threshold` (integer, default: `2`)
+Same as CLI option above.
+
+**MCP Example:**
+```json
+{
+  "json_string": "{\"data\": [...]}",
+  "strict_typing": true,
+  "position_dependent": false,
+  "repeat_threshold": 2
+}
+```
+
+### Advanced: GHOST Mode (Python only)
+
+**Note:** GHOST mode is currently only available in the Python reference implementation.
+
+GHOST mode shows value ranges for primitive fields instead of just structure:
+- Single unique value: shown as-is
+- Multiple values (up to N): shown as `[value1, value2, ...]`
+- More than N values: shown with indicator `... (and X more unique values)`
+
+This mode is experimental and not yet available in the Rust CLI.
 
 ## License
 

@@ -15,9 +15,20 @@ pub struct CliArgs {
     #[arg(short, long, value_name = "FILE")]
     pub output_file: Option<PathBuf>,
 
-    #[arg(long, default_value_t = true)]
+    /// Enable strict type checking (int vs float are different structures).
+    /// When true: treats integers and floats as distinct structure types.
+    /// When false: treats all numbers as the same type.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub strict_typing: bool,
 
+    /// Position-dependent mode: controls how examples are shown across nesting levels.
+    /// When true: shows examples independently at each depth (predictable, depth-aware).
+    /// When false: shows examples only at shallowest occurrence (more concise, globally unique).
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    pub position_dependent: bool,
+
+    /// Minimum repeat count for pattern summarization (internal, affects formatting).
+    /// Controls how patterns are displayed in summaries. Value >=2 recommended.
     #[arg(short, long, value_name = "N", default_value_t = 1)]
     pub repeat_threshold: usize,
 

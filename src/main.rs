@@ -94,7 +94,7 @@ fn run_cli(args: &CliArgs) -> Result<()> {
         .with_context(|| format!("Failed to parse JSON from file: {}", input_path_ref.display()))?;
 
     println!("Distilling JSON...");
-    let distilled_json = core::distill_json(input_json, args.strict_typing, args.repeat_threshold)
+    let distilled_json = core::distill_json(input_json, args.strict_typing, args.repeat_threshold, args.position_dependent)
         .context("Distillation process failed")?;
     println!("Distillation complete.");
 
